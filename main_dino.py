@@ -21,12 +21,12 @@ import json
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
 from torchvision import datasets, transforms
 from torchvision import models as torchvision_models
 
@@ -140,8 +140,9 @@ def get_args_parser():
 def train_dino(args):
     utils.init_distributed_mode(args)
     utils.fix_random_seeds(args.seed)
-    print("git:\n  {}\n".format(utils.get_sha()))
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
+    with (Path(args.output_dir) / "settings.json").open("w") as f:
+        json.dump(args.__dict__, f, indent=2, sort_keys=True)
     cudnn.benchmark = True
 
     # ============ preparing data ... ============
@@ -272,6 +273,12 @@ def train_dino(args):
     )
     start_epoch = to_restore["epoch"]
 
+    # create tensorboard - summarywriter
+    writer = None
+    if torch.distributed.get_rank() == 0:
+        path = Path(args.output_dir).joinpath("summary")
+        writer = SummaryWriter(path)
+
     start_time = time.time()
     print("Starting DINO training !")
     for epoch in range(start_epoch, args.epochs):
@@ -280,7 +287,7 @@ def train_dino(args):
         # ============ training one epoch of DINO ... ============
         train_stats = train_one_epoch(student, teacher, teacher_without_ddp, dino_loss,
                                       data_loader, optimizer, lr_schedule, wd_schedule, momentum_schedule,
-                                      epoch, fp16_scaler, args)
+                                      epoch, fp16_scaler, writer, args)
 
         # ============ writing logs ... ============
         save_dict = {
@@ -308,7 +315,7 @@ def train_dino(args):
 
 def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loader,
                     optimizer, lr_schedule, wd_schedule, momentum_schedule, epoch,
-                    fp16_scaler, args):
+                    fp16_scaler, writer, args):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
     for it, (images, _) in enumerate(metric_logger.log_every(data_loader, 10, header)):
@@ -318,10 +325,10 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
             param_group["lr"] = lr_schedule[it]
             if i == 0:  # only the first group is regularized
                 param_group["weight_decay"] = wd_schedule[it]
+
         # move images to gpu
         images = [im.cuda(non_blocking=True) for im in images]
-        images = dino_mixup(images, args.mixup_alpha)
-        images = dino_cutmix(images, args.cutmix_beta)
+
         # teacher and student forward passes + compute dino loss
         with torch.cuda.amp.autocast(fp16_scaler is not None):
             teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
@@ -357,6 +364,11 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
             m = momentum_schedule[it]  # momentum parameter
             for param_q, param_k in zip(student.module.parameters(), teacher_without_ddp.parameters()):
                 param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
+
+        if torch.distributed.get_rank() == 0:
+            writer.add_scalar(tag="loss", scalar_value=loss.item(), global_step=it)
+            writer.add_scalar(tag="loss", scalar_value=optimizer.param_groups[0]["lr"], global_step=it)
+            writer.add_scalar(tag="wd", scalar_value=optimizer.param_groups[0]["weight_decay"], global_step=it)
 
         # logging
         torch.cuda.synchronize()
@@ -457,58 +469,6 @@ class DataAugmentationDINO(object):
         for _ in range(self.local_crops_number):
             crops.append(self.local_transfo(image))
         return crops
-
-
-def mixup(x, alpha, use_cuda=True):
-    if alpha > 0:
-        lam = np.random.beta(alpha, alpha)
-    else:
-        lam = 1
-
-    batch_size = x.size()[0]
-    if use_cuda:
-        index = torch.randperm(batch_size).cuda()
-    else:
-        index = torch.randperm(batch_size)
-
-    mixed_x = lam * x + (1 - lam) * x[index, :]
-    return mixed_x
-
-
-def dino_mixup(images, alpha=1.0):
-    return [mixup(image, alpha) for image in images]
-
-
-def cutmix(x, beta):
-    out = x.clone()
-    lam = np.random.beta(beta, beta)
-    rand_index = torch.randperm(x.size()[0]).cuda()
-    bbx1, bby1, bbx2, bby2 = rand_bbox(x.size(), lam)
-    out[:, :, bbx1:bbx2, bby1:bby2] = x[rand_index, :, bbx1:bbx2, bby1:bby2]
-    return out
-
-
-def dino_cutmix(images, beta=1.0):
-    return [cutmix(image, beta) for image in images]
-
-
-def rand_bbox(size, lam):
-    W = size[2]
-    H = size[3]
-    cut_rat = np.sqrt(1. - lam)
-    cut_w = int(W * cut_rat)
-    cut_h = int(H * cut_rat)
-
-    # uniform
-    cx = np.random.randint(W)
-    cy = np.random.randint(H)
-
-    bbx1 = np.clip(cx - cut_w // 2, 0, W)
-    bby1 = np.clip(cy - cut_h // 2, 0, H)
-    bbx2 = np.clip(cx + cut_w // 2, 0, W)
-    bby2 = np.clip(cy + cut_h // 2, 0, H)
-
-    return bbx1, bby1, bbx2, bby2
 
 
 if __name__ == '__main__':

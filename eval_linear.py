@@ -14,11 +14,12 @@
 import os
 import argparse
 import json
+import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch import nn
-import torch.distributed as dist
 import torch.backends.cudnn as cudnn
 from torchvision import datasets
 from torchvision import transforms as pth_transforms
@@ -30,7 +31,6 @@ import vision_transformer as vits
 
 def eval_linear(args):
     utils.init_distributed_mode(args)
-    print("git:\n  {}\n".format(utils.get_sha()))
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
     cudnn.benchmark = True
 
@@ -78,7 +78,8 @@ def eval_linear(args):
 
     if args.evaluate:
         utils.load_pretrained_linear_weights(linear_classifier, args.arch, args.patch_size)
-        test_stats = validate_network(val_loader, model, linear_classifier, args.n_last_blocks, args.avgpool_patchtokens)
+        test_stats = validate_network(val_loader, model, linear_classifier, args.n_last_blocks,
+                                      args.avgpool_patchtokens)
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         return
 
@@ -102,9 +103,9 @@ def eval_linear(args):
     # set optimizer
     optimizer = torch.optim.SGD(
         linear_classifier.parameters(),
-        args.lr * (args.batch_size_per_gpu * utils.get_world_size()) / 256., # linear scaling rule
+        args.lr * (args.batch_size_per_gpu * utils.get_world_size()) / 256.,  # linear scaling rule
         momentum=0.9,
-        weight_decay=0, # we do not apply weight decay
+        weight_decay=0,  # we do not apply weight decay
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs, eta_min=0)
 
@@ -123,14 +124,17 @@ def eval_linear(args):
     for epoch in range(start_epoch, args.epochs):
         train_loader.sampler.set_epoch(epoch)
 
-        train_stats = train(model, linear_classifier, optimizer, train_loader, epoch, args.n_last_blocks, args.avgpool_patchtokens)
+        train_stats = train(model, linear_classifier, optimizer, train_loader, epoch, args.n_last_blocks,
+                            args.avgpool_patchtokens)
         scheduler.step()
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      'epoch': epoch}
         if epoch % args.val_freq == 0 or epoch == args.epochs - 1:
-            test_stats = validate_network(val_loader, model, linear_classifier, args.n_last_blocks, args.avgpool_patchtokens)
-            print(f"Accuracy at epoch {epoch} of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+            test_stats = validate_network(val_loader, model, linear_classifier, args.n_last_blocks,
+                                          args.avgpool_patchtokens)
+            print(
+                f"Accuracy at epoch {epoch} of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
             best_acc = max(best_acc, test_stats["acc1"])
             print(f'Max accuracy so far: {best_acc:.2f}%')
             log_stats = {**{k: v for k, v in log_stats.items()},
@@ -147,7 +151,7 @@ def eval_linear(args):
             }
             torch.save(save_dict, os.path.join(args.output_dir, "checkpoint.pth.tar"))
     print("Training of the supervised linear classifier on frozen features completed.\n"
-                "Top-1 test accuracy: {acc:.1f}".format(acc=best_acc))
+          "Top-1 test accuracy: {acc:.1f}".format(acc=best_acc))
 
 
 def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool):
@@ -166,7 +170,8 @@ def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool):
                 intermediate_output = model.get_intermediate_layers(inp, n)
                 output = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
                 if avgpool:
-                    output = torch.cat((output.unsqueeze(-1), torch.mean(intermediate_output[-1][:, 1:], dim=1).unsqueeze(-1)), dim=-1)
+                    output = torch.cat(
+                        (output.unsqueeze(-1), torch.mean(intermediate_output[-1][:, 1:], dim=1).unsqueeze(-1)), dim=-1)
                     output = output.reshape(output.shape[0], -1)
             else:
                 output = model(inp)
@@ -208,7 +213,8 @@ def validate_network(val_loader, model, linear_classifier, n, avgpool):
                 intermediate_output = model.get_intermediate_layers(inp, n)
                 output = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
                 if avgpool:
-                    output = torch.cat((output.unsqueeze(-1), torch.mean(intermediate_output[-1][:, 1:], dim=1).unsqueeze(-1)), dim=-1)
+                    output = torch.cat(
+                        (output.unsqueeze(-1), torch.mean(intermediate_output[-1][:, 1:], dim=1).unsqueeze(-1)), dim=-1)
                     output = output.reshape(output.shape[0], -1)
             else:
                 output = model(inp)
@@ -227,15 +233,16 @@ def validate_network(val_loader, model, linear_classifier, n, avgpool):
             metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
     if linear_classifier.module.num_labels >= 5:
         print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
-          .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
+              .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
     else:
         print('* Acc@1 {top1.global_avg:.3f} loss {losses.global_avg:.3f}'
-          .format(top1=metric_logger.acc1, losses=metric_logger.loss))
+              .format(top1=metric_logger.acc1, losses=metric_logger.loss))
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
 class LinearClassifier(nn.Module):
     """Linear layer to train on top of frozen features"""
+
     def __init__(self, dim, num_labels=1000):
         super(LinearClassifier, self).__init__()
         self.num_labels = num_labels
@@ -251,17 +258,70 @@ class LinearClassifier(nn.Module):
         return self.linear(x)
 
 
+def mixup(x, alpha, use_cuda=True):
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+
+    batch_size = x.size()[0]
+    if use_cuda:
+        index = torch.randperm(batch_size).cuda()
+    else:
+        index = torch.randperm(batch_size)
+
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    return mixed_x
+
+
+def dino_mixup(images, alpha=1.0):
+    return [mixup(image, alpha) for image in images]
+
+
+def cutmix(x, beta):
+    out = x.clone()
+    lam = np.random.beta(beta, beta)
+    rand_index = torch.randperm(x.size()[0]).cuda()
+    bbx1, bby1, bbx2, bby2 = rand_bbox(x.size(), lam)
+    out[:, :, bbx1:bbx2, bby1:bby2] = x[rand_index, :, bbx1:bbx2, bby1:bby2]
+    return out
+
+
+def dino_cutmix(images, beta=1.0):
+    return [cutmix(image, beta) for image in images]
+
+
+def rand_bbox(size, lam):
+    W = size[2]
+    H = size[3]
+    cut_rat = np.sqrt(1. - lam)
+    cut_w = int(W * cut_rat)
+    cut_h = int(H * cut_rat)
+
+    # uniform
+    cx = np.random.randint(W)
+    cy = np.random.randint(H)
+
+    bbx1 = np.clip(cx - cut_w // 2, 0, W)
+    bby1 = np.clip(cy - cut_h // 2, 0, H)
+    bbx2 = np.clip(cx + cut_w // 2, 0, W)
+    bby2 = np.clip(cy + cut_h // 2, 0, H)
+
+    return bbx1, bby1, bbx2, bby2
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('Evaluation with linear classification on ImageNet')
     parser.add_argument('--n_last_blocks', default=4, type=int, help="""Concatenate [CLS] tokens
         for the `n` last blocks. We use `n=4` when evaluating ViT-Small and `n=1` with ViT-Base.""")
     parser.add_argument('--avgpool_patchtokens', default=False, type=utils.bool_flag,
-        help="""Whether ot not to concatenate the global average pooled features to the [CLS] token.
+                        help="""Whether ot not to concatenate the global average pooled features to the [CLS] token.
         We typically set this to False for ViT-Small and to True with ViT-Base.""")
     parser.add_argument('--arch', default='vit_small', type=str, help='Architecture')
     parser.add_argument('--patch_size', default=16, type=int, help='Patch resolution of the model.')
     parser.add_argument('--pretrained_weights', default='', type=str, help="Path to pretrained weights to evaluate.")
-    parser.add_argument("--checkpoint_key", default="teacher", type=str, help='Key to use in the checkpoint (example: "teacher")')
+    parser.add_argument("--checkpoint_key", default="teacher", type=str,
+                        help='Key to use in the checkpoint (example: "teacher")')
     parser.add_argument('--epochs', default=100, type=int, help='Number of epochs of training.')
     parser.add_argument("--lr", default=0.001, type=float, help="""Learning rate at the beginning of
         training (highest LR used during training). The learning rate is linearly scaled
