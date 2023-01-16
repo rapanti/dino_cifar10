@@ -118,12 +118,6 @@ def get_args_parser():
                         help="""Scale range of the cropped image before resizing, relatively to the origin image.
         Used for small local view cropping of multi-crop.""")
 
-    # Augment parameters
-    parser.add_argument("--mixup_alpha", type=float, default=1.0,
-                        help="Alpha parameter of MixUp.")
-    parser.add_argument("--cutmix_beta", type=float, default=1.0,
-                        help="Alpha parameter of CutMix.")
-
     # Misc
     parser.add_argument('--data_path', default='/path/to/imagenet/train/', type=str,
                         help='Please specify path to the ImageNet training data.')
