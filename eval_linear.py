@@ -153,7 +153,8 @@ def eval_linear(args):
             log_stats = {**{k: v for k, v in log_stats.items()},
                          **{f'test_{k}': v for k, v in test_stats.items()}}
             writer.add_scalar(tag="acc1@epoch", scalar_value=test_stats["acc1"], global_step=epoch)
-            writer.add_scalar(tag="max acc", scalar_value=best_acc, global_step=epoch)
+            writer.add_scalar(tag="acc5@epoch", scalar_value=test_stats["acc5"], global_step=epoch)
+            writer.add_scalar(tag="best-acc", scalar_value=best_acc, global_step=epoch)
         if utils.is_main_process():
             with (Path(args.output_dir) / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
