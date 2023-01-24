@@ -365,7 +365,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
         if torch.distributed.get_rank() == 0:
             writer.add_scalar(tag="loss", scalar_value=loss.item(), global_step=it)
             writer.add_scalar(tag="lr", scalar_value=optimizer.param_groups[0]["lr"], global_step=it)
-            writer.add_scalar(tag="wd", scalar_value=optimizer.param_groups[0]["weight_decay"], global_step=it)
+            writer.add_scalar(tag="weight_decay", scalar_value=optimizer.param_groups[0]["weight_decay"], global_step=it)
 
         # logging
         torch.cuda.synchronize()
