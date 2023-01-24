@@ -1,11 +1,11 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
-#
+# 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-#
+# 
 #     http://www.apache.org/licenses/LICENSE-2.0
-#
+# 
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -23,6 +23,10 @@ import torch.distributed as dist
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import models as torchvision_models
+from timm.data import Mixup
+from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
+from timm.optim import create_optimizer
+from timm.scheduler import create_scheduler
 
 import utils
 import vision_transformer as vits
@@ -39,7 +43,7 @@ def eval_linear(args):
     # if the network is a Vision Transformer (i.e. vit_tiny, vit_small, vit_base)
     if args.arch in vits.__dict__.keys():
         model = vits.__dict__[args.arch](patch_size=args.patch_size, num_classes=0)
-        embed_dim = model.embed_dim * (args.n_last_blocks + int(args.avgpool_patchtokens))
+        embed_dim = model.embed_dim * (args.num_last_blocks + int(args.avgpool_patchtokens))
     # if the network is a XCiT
     elif "xcit" in args.arch:
         model = torch.hub.load('facebookresearch/xcit:main', args.arch, num_classes=0)
@@ -59,7 +63,7 @@ def eval_linear(args):
     print(f"Model {args.arch} built.")
 
     # ============ preparing data ... ============
-    dataset_val, args.num_labels = utils.build_dataset(is_train=False, args=args)
+    dataset_val, args.num_classes = utils.build_dataset(is_train=False, args=args)
     sampler = torch.utils.data.SequentialSampler(dataset_val)
     val_loader = torch.utils.data.DataLoader(
         dataset_val, sampler=sampler,
@@ -69,18 +73,17 @@ def eval_linear(args):
         drop_last=False
     )
 
-    linear_classifier = LinearClassifier(embed_dim, num_labels=args.num_labels)
+    linear_classifier = LinearClassifier(embed_dim, num_labels=args.num_classes)
     linear_classifier = linear_classifier.cuda()
     linear_classifier = nn.parallel.DistributedDataParallel(linear_classifier, device_ids=[args.gpu])
 
     if args.evaluate:
         utils.load_pretrained_linear_weights(linear_classifier, args.arch, args.patch_size)
-        test_stats = validate_network(val_loader, model, linear_classifier, args.n_last_blocks,
-                                      args.avgpool_patchtokens)
+        test_stats = validate_network(val_loader, model, linear_classifier, args.n_last_blocks, args.avgpool_patchtokens)
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         return
 
-    dataset_train, args.num_labels = utils.build_dataset(is_train=True, args=args)
+    dataset_train, args.num_classes = utils.build_dataset(is_train=True, args=args)
     sampler = torch.utils.data.distributed.DistributedSampler(dataset_train)
     train_loader = torch.utils.data.DataLoader(
         dataset_train,
@@ -88,17 +91,37 @@ def eval_linear(args):
         batch_size=args.batch_size_per_gpu,
         num_workers=args.num_workers,
         pin_memory=True,
+        drop_last=True,
     )
     print(f"Data loaded with {len(dataset_train)} train and {len(dataset_val)} val imgs.")
 
-    # set optimizer
-    optimizer = torch.optim.SGD(
-        linear_classifier.parameters(),
-        args.lr * (args.batch_size_per_gpu * utils.get_world_size()) / 768.,  # linear scaling rule
-        momentum=args.momentum,
-        weight_decay=args.weight_decay,  # we do not apply weight decay
-    )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs, eta_min=0)
+    if args.evaluate:
+        utils.load_pretrained_linear_weights(linear_classifier, args.arch, args.patch_size)
+        test_stats = validate_network(val_loader, model, linear_classifier, args.num_last_blocks,
+                                      args.avgpool_patchtokens)
+        print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+        return
+
+    # create optimizer
+    optimizer = create_optimizer(args, linear_classifier)
+
+    lr_scheduler, _ = create_scheduler(args, optimizer)
+
+    mixup_fn = None
+    mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
+    if mixup_active:
+        mixup_fn = Mixup(
+            mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
+            prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
+            label_smoothing=args.smoothing, num_classes=args.num_classes)
+
+    if mixup_active:
+        # smoothing is handled with mixup label transform
+        criterion = SoftTargetCrossEntropy()
+    elif args.smoothing:
+        criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
+    else:
+        criterion = torch.nn.CrossEntropyLoss()
 
     # Optionally resume from a checkpoint
     to_restore = {"epoch": 0, "best_acc": 0.}
@@ -107,7 +130,7 @@ def eval_linear(args):
         run_variables=to_restore,
         state_dict=linear_classifier,
         optimizer=optimizer,
-        scheduler=scheduler,
+        scheduler=lr_scheduler,
     )
     start_epoch = to_restore["epoch"]
     best_acc = to_restore["best_acc"]
@@ -120,17 +143,17 @@ def eval_linear(args):
     for epoch in range(start_epoch, args.epochs):
         train_loader.sampler.set_epoch(epoch)
 
-        train_stats = train(model, linear_classifier, optimizer, train_loader, epoch, args.n_last_blocks,
-                            args.avgpool_patchtokens, writer)
-        scheduler.step()
+        train_stats = train(model, linear_classifier, optimizer, criterion, train_loader, epoch, args.num_last_blocks,
+                            args.avgpool_patchtokens, mixup_fn, writer)
+        lr_scheduler.step(epoch)
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      'epoch': epoch}
+
         if epoch % args.val_freq == 0 or epoch == args.epochs - 1:
-            test_stats = validate_network(val_loader, model, linear_classifier, args.n_last_blocks,
+            test_stats = validate_network(val_loader, model, linear_classifier, args.num_last_blocks,
                                           args.avgpool_patchtokens)
-            print(
-                f"Accuracy at epoch {epoch} of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+            print(f"Accuracy at epoch {epoch} of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
             best_acc = max(best_acc, test_stats["acc1"])
             print(f'Max accuracy so far: {best_acc:.2f}%')
             log_stats = {**{k: v for k, v in log_stats.items()},
@@ -145,7 +168,7 @@ def eval_linear(args):
                 "epoch": epoch + 1,
                 "state_dict": linear_classifier.state_dict(),
                 "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
+                "scheduler": lr_scheduler.state_dict(),
                 "best_acc": best_acc,
             }
             torch.save(save_dict, os.path.join(args.output_dir, "checkpoint.pth.tar"))
@@ -153,9 +176,9 @@ def eval_linear(args):
           "Top-1 test accuracy: {acc:.1f}".format(acc=best_acc))
 
 
-def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool, writer):
+def train(model, linear_classifier, optimizer, criterion, loader, epoch, num_blocks, avgpool, mixup_fn, writer):
     linear_classifier.train()
-    metric_logger = utils.MetricLogger(delimiter="  ")
+    metric_logger = utils.MetricLogger(delimiter=" ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
     for it, (samples, targets) in enumerate(metric_logger.log_every(loader, 20, header)):
@@ -166,10 +189,13 @@ def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool, writer
         samples = samples.cuda(non_blocking=True)
         targets = targets.cuda(non_blocking=True)
 
+        if mixup_fn is not None:
+            samples, targets = mixup_fn(samples, targets)
+
         # forward
         with torch.no_grad():
             if "vit" in args.arch:
-                intermediate_output = model.get_intermediate_layers(samples, n)
+                intermediate_output = model.get_intermediate_layers(samples, num_blocks)
                 output = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
                 if avgpool:
                     output = torch.cat(
@@ -179,8 +205,8 @@ def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool, writer
                 output = model(samples)
         output = linear_classifier(output)
 
-        # compute cross entropy loss
-        loss = nn.CrossEntropyLoss()(output, targets)
+        # compute loss
+        loss = criterion(output, targets)
 
         # compute the gradients
         optimizer.zero_grad()
@@ -205,35 +231,35 @@ def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool, writer
 
 
 @torch.no_grad()
-def validate_network(val_loader, model, linear_classifier, n, avgpool):
+def validate_network(val_loader, model, linear_classifier, num_blocks, avgpool):
     linear_classifier.eval()
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Test:'
-    for inp, target in metric_logger.log_every(val_loader, 20, header):
+    for samples, targets in metric_logger.log_every(val_loader, 20, header):
         # move to gpu
-        inp = inp.cuda(non_blocking=True)
-        target = target.cuda(non_blocking=True)
+        samples = samples.cuda(non_blocking=True)
+        targets = targets.cuda(non_blocking=True)
 
         # forward
         with torch.no_grad():
             if "vit" in args.arch:
-                intermediate_output = model.get_intermediate_layers(inp, n)
+                intermediate_output = model.get_intermediate_layers(samples, num_blocks)
                 output = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
                 if avgpool:
                     output = torch.cat(
                         (output.unsqueeze(-1), torch.mean(intermediate_output[-1][:, 1:], dim=1).unsqueeze(-1)), dim=-1)
                     output = output.reshape(output.shape[0], -1)
             else:
-                output = model(inp)
+                output = model(samples)
         output = linear_classifier(output)
-        loss = nn.CrossEntropyLoss()(output, target)
+        loss = nn.CrossEntropyLoss()(output, targets)
 
         if linear_classifier.module.num_labels >= 5:
-            acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
+            acc1, acc5 = utils.accuracy(output, targets, topk=(1, 5))
         else:
-            acc1, = utils.accuracy(output, target, topk=(1,))
+            acc1, = utils.accuracy(output, targets, topk=(1,))
 
-        batch_size = inp.shape[0]
+        batch_size = samples.shape[0]
         metric_logger.update(loss=loss.item())
         metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
         if linear_classifier.module.num_labels >= 5:
@@ -272,11 +298,11 @@ if __name__ == '__main__':
     # Model parameters
     parser.add_argument('--arch', default='vit_small', type=str, help='Architecture')
     parser.add_argument('--patch_size', default=16, type=int, help='Patch resolution of the model.')
-    parser.add_argument('--image_size', default=224, type=int, help='images input size')
+    parser.add_argument('--input-size', default=224, type=int, help='images input size')
     parser.add_argument('--pretrained_weights', default='', type=str, help="Path to pretrained weights to evaluate.")
     parser.add_argument("--checkpoint_key", default="teacher", type=str,
                         help='Key to use in the checkpoint (example: "teacher")')
-    parser.add_argument('--n_last_blocks', default=4, type=int, help="""Concatenate [CLS] tokens for the `n` last 
+    parser.add_argument('--num_last_blocks', default=4, type=int, help="""Concatenate [CLS] tokens for the `n` last 
                         blocks. We use `n=4` when evaluating ViT-Small and `n=1` with ViT-Base.""")
     parser.add_argument('--avgpool_patchtokens', default=False, type=utils.bool_flag,
                         help='Whether or not to concatenate the global average pooled features to the [CLS] token. '
@@ -284,24 +310,100 @@ if __name__ == '__main__':
     # Optimizer parameters
     parser.add_argument('--opt', default='adamw', type=str, metavar='OPTIMIZER',
                         help='Optimizer (default: "adamw"')
-    parser.add_argument('--momentum', type=float, default=0.9,
+    parser.add_argument('--opt-eps', default=1e-8, type=float, metavar='EPSILON',
+                        help='Optimizer Epsilon (default: 1e-8)')
+    parser.add_argument('--opt-betas', default=None, type=float, nargs='+', metavar='BETA',
+                        help='Optimizer Betas (default: None, use opt default)')
+    parser.add_argument('--clip-grad', type=float, default=None, metavar='NORM',
+                        help='Clip gradient norm (default: None, no clipping)')
+    parser.add_argument('--momentum', type=float, default=0.9, metavar='M',
                         help='SGD momentum (default: 0.9)')
     parser.add_argument('--weight_decay', type=float, default=0.05,
                         help='weight decay (default: 0.05)')
-    parser.add_argument('--lr', type=float, default=0.001,
-                        help='learning rate (default: 0.001)')
+    # Learning rate schedule parameters
+    parser.add_argument('--sched', default='cosine', type=str, metavar='SCHEDULER',
+                        help='LR scheduler (default: "cosine"')
+    parser.add_argument('--lr', type=float, default=5e-4, metavar='LR',
+                        help='learning rate (default: 5e-4)')
+    parser.add_argument('--lr-noise', type=float, nargs='+', default=None, metavar='pct, pct',
+                        help='learning rate noise on/off epoch percentages')
+    parser.add_argument('--lr-noise-pct', type=float, default=0.67, metavar='PERCENT',
+                        help='learning rate noise limit percent (default: 0.67)')
+    parser.add_argument('--lr-noise-std', type=float, default=1.0, metavar='STDDEV',
+                        help='learning rate noise std-dev (default: 1.0)')
+    parser.add_argument('--warmup-lr', type=float, default=1e-6, metavar='LR',
+                        help='warmup learning rate (default: 1e-6)')
+    parser.add_argument('--min-lr', type=float, default=1e-5, metavar='LR',
+                        help='lower lr bound for cyclic schedulers that hit 0 (1e-5)')
+    parser.add_argument('--decay-epochs', type=float, default=30, metavar='N',
+                        help='epoch interval to decay LR')
+    parser.add_argument('--warmup-epochs', type=int, default=5, metavar='N',
+                        help='epochs to warmup LR, if scheduler supports')
+    parser.add_argument('--cooldown-epochs', type=int, default=10, metavar='N',
+                        help='epochs to cooldown LR at min_lr, after cyclic schedule ends')
+    parser.add_argument('--patience-epochs', type=int, default=10, metavar='N',
+                        help='patience epochs for Plateau LR scheduler (default: 10')
+    parser.add_argument('--decay-rate', '--dr', type=float, default=0.1, metavar='RATE',
+                        help='LR decay rate (default: 0.1)')
     # Dataset parameters
     parser.add_argument('--dataset', default="ImageNet", choices=["ImageNet", "CIFAR10", "CIFAR100"], type=str,
                         help='Specify name of dataset (default: ImageNet)')
     parser.add_argument('--data_path', default='/path/to/imagenet/', type=str, help='Specify path to your dataset.')
+    # Augmentation parameters
+    parser.add_argument('--color-jitter', type=float, default=0.3, metavar='PCT',
+                        help='Color jitter factor (default: 0.3)')
+    parser.add_argument('--aa', type=str, default='rand-m9-mstd0.5-inc1', metavar='NAME',
+                        help='Use AutoAugment policy. "v0" or "original". " + \
+                             "(default: rand-m9-mstd0.5-inc1)'),
+    parser.add_argument('--smoothing', type=float, default=0.1, help='Label smoothing (default: 0.1)')
+    parser.add_argument('--train-interpolation', type=str, default='bicubic',
+                        help='Training interpolation (random, bilinear, bicubic default: "bicubic")')
+
+    parser.add_argument('--repeated-aug', action='store_true')
+    parser.add_argument('--no-repeated-aug', action='store_false', dest='repeated_aug')
+    parser.set_defaults(repeated_aug=True)
+
+    parser.add_argument('--train-mode', action='store_true')
+    parser.add_argument('--no-train-mode', action='store_false', dest='train_mode')
+    parser.set_defaults(train_mode=True)
+
+    parser.add_argument('--ThreeAugment', action='store_true')  # 3augment
+
+    parser.add_argument('--src', action='store_true')  # simple random crop
+    # * Random Erase params
+    parser.add_argument('--reprob', type=float, default=0.25, metavar='PCT',
+                        help='Random erase prob (default: 0.25)')
+    parser.add_argument('--remode', type=str, default='pixel',
+                        help='Random erase mode (default: "pixel")')
+    parser.add_argument('--recount', type=int, default=1,
+                        help='Random erase count (default: 1)')
+    parser.add_argument('--resplit', action='store_true', default=False,
+                        help='Do not random erase first (clean) augmentation split')
+
+    # * Mixup params
+    parser.add_argument('--mixup', type=float, default=0,
+                        help='mixup alpha, mixup enabled if > 0. (default: 0)')
+    parser.add_argument('--cutmix', type=float, default=0,
+                        help='cutmix alpha, cutmix enabled if > 0. (default: 0)')
+    parser.add_argument('--cutmix-minmax', type=float, nargs='+', default=None,
+                        help='cutmix min/max ratio, overrides alpha and enables cutmix if set (default: None)')
+    parser.add_argument('--mixup-prob', type=float, default=1.0,
+                        help='Probability of performing mixup or cutmix when either/both is enabled')
+    parser.add_argument('--mixup-switch-prob', type=float, default=0.5,
+                        help='Probability of switching to cutmix when both mixup and cutmix enabled')
+    parser.add_argument('--mixup-mode', type=str, default='batch',
+                        help='How to apply mixup/cutmix params. Per "batch", "pair", or "elem"')
     # distributed training parameters
     parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
+    parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')
+    parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
     # Misc
     parser.add_argument('--num_workers', default=10, type=int, help='Number of data loading workers per GPU.')
     parser.add_argument('--val_freq', default=1, type=int, help="Epoch frequency for validation.")
     parser.add_argument('--output_dir', default=".", help='Path to save logs and checkpoints')
     parser.add_argument('--evaluate', dest='evaluate', action='store_true', help='evaluate model on validation set')
+    parser.add_argument('--eval-crop-ratio', default=0.875, type=float, help="Crop ratio for evaluation")
 
     args = parser.parse_args()
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
