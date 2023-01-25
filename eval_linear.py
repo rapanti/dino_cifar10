@@ -39,7 +39,7 @@ def eval_linear(args):
     # if the network is a Vision Transformer (i.e. vit_tiny, vit_small, vit_base)
     if args.arch in vits.__dict__.keys():
         model = vits.__dict__[args.arch](
-            img_size=args.img_size,
+            img_size=(args.img_size,),
             patch_size=args.patch_size,
             num_classes=0)
         embed_dim = model.embed_dim * (args.n_last_blocks + int(args.avgpool_patchtokens))
