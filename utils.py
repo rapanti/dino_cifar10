@@ -495,7 +495,7 @@ def init_distributed_mode(args):
         sys.exit(1)
 
     dist.init_process_group(
-        backend="gloo",
+        backend="nccl",
         init_method=args.dist_url,
         world_size=args.world_size,
         rank=args.rank,
