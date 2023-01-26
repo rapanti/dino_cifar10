@@ -138,9 +138,10 @@ def eval_linear(args):
             print(f'Max accuracy so far: {best_acc:.2f}%')
             log_stats = {**{k: v for k, v in log_stats.items()},
                          **{f'test_{k}': v for k, v in test_stats.items()}}
-            writer.add_scalar(tag="acc1", scalar_value=test_stats["acc1"], global_step=epoch)
-            writer.add_scalar(tag="acc5", scalar_value=test_stats["acc5"], global_step=epoch)
-            writer.add_scalar(tag="best-acc", scalar_value=best_acc, global_step=epoch)
+            if writer:
+                writer.add_scalar(tag="acc1", scalar_value=test_stats["acc1"], global_step=epoch)
+                writer.add_scalar(tag="acc5", scalar_value=test_stats["acc5"], global_step=epoch)
+                writer.add_scalar(tag="best-acc", scalar_value=best_acc, global_step=epoch)
         if utils.is_main_process():
             with (Path(args.output_dir) / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
@@ -197,7 +198,7 @@ def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool, writer
         metric_logger.update(loss=loss.item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
-        if torch.distributed.get_rank() == 0:
+        if writer:
             writer.add_scalar(tag="loss", scalar_value=loss.item(), global_step=it)
             writer.add_scalar(tag="lr", scalar_value=optimizer.param_groups[0]["lr"], global_step=it)
             writer.add_scalar(tag="weight_decay", scalar_value=optimizer.param_groups[0]["weight_decay"], global_step=it)
