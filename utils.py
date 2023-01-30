@@ -892,13 +892,14 @@ def build_transform(is_train, args):
     if args.dataset == 'CIFAR10':
         if is_train:
             return transforms.Compose([
-                transforms.RandomResizedCrop(32),
+                transforms.RandomResizedCrop(args.img_size),
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),
                 transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))])
+        factor = args.img_size // 32
         return transforms.Compose([
-            transforms.Resize(36, interpolation=InterpolationMode.BICUBIC),
-            transforms.CenterCrop(32),
+            transforms.Resize(args.img_size + factor * 4, interpolation=InterpolationMode.BICUBIC),
+            transforms.CenterCrop(args.img_size),
             transforms.ToTensor(),
             transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))])
     if args.dataset == 'ImageNet':
