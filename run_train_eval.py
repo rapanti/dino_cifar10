@@ -106,6 +106,7 @@ parser.add_argument("--resize_size", default=512, type=int,
 # ======================================================================================================================
 # Model parameters
 parser.add_argument('--pretrained_weights', default='', type=str, help="Path to pretrained weights to evaluate.")
+parser.add_argument('--pretrained_linear_weights', default='', type=str, help="Path to pretrained linear weights.")
 parser.add_argument("--checkpoint_key", default="teacher", type=str,
                     help='Key to use in the checkpoint (example: "teacher")')
 parser.add_argument('--n_last_blocks', default=4, type=int, help="""Concatenate [CLS] tokens for the `n` last 
