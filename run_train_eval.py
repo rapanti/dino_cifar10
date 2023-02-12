@@ -53,7 +53,7 @@ parser.add_argument('--weight_decay_end', type=float, default=0.4, help="""Final
 parser.add_argument('--clip_grad', type=float, default=3.0, help="""Maximal parameter
     gradient norm if using gradient clipping. Clipping with norm .3 ~ 1.0 can
     help optimization for larger ViT architectures. 0 for disabling.""")
-parser.add_argument('--batch_size_per_gpu', default=256, type=int,
+parser.add_argument('--batch_size', default=256, type=int,
                     help='mini-batch size (default: 256), this is the total batch size of all GPUs')
 parser.add_argument('--epochs', default=100, type=int, help='Number of epochs of training.')
 parser.add_argument('--freeze_last_layer', default=1, type=int, help="""Number of epochs
@@ -135,7 +135,7 @@ if __name__ == "__main__":
 
     if 'eval' in args.pipeline_mode:
         # change linear specific parameters
-        args.epochs = 300
+        args.epochs = 200
         args.lr = 0.01
         args.momentum = 0.9
         args.weight_decay = 0

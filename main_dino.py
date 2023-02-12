@@ -90,8 +90,8 @@ def get_args_parser():
     parser.add_argument('--clip_grad', type=float, default=3.0, help="""Maximal parameter
         gradient norm if using gradient clipping. Clipping with norm .3 ~ 1.0 can
         help optimization for larger ViT architectures. 0 for disabling.""")
-    parser.add_argument('--batch_size_per_gpu', default=64, type=int,
-                        help='Per-GPU batch-size : number of distinct images loaded on one GPU.')
+    parser.add_argument('--batch_size', default=64, type=int,
+                        help='Total mini-batch size (on all gpus together).')
     parser.add_argument('--epochs', default=100, type=int, help='Number of epochs of training.')
     parser.add_argument('--freeze_last_layer', default=1, type=int, help="""Number of epochs
         during which we keep the output layer fixed. Typically doing so during
@@ -151,6 +151,7 @@ def train_dino(args):
     # dataset = datasets.ImageFolder(args.data_path, transform=transform)
     dataset = datasets.CIFAR10(args.data_path, train=True, transform=transform)
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
+    args.batch_size_per_gpu = int(args.batch_size / utils.get_world_size())
     data_loader = torch.utils.data.DataLoader(
         dataset,
         sampler=sampler,
@@ -440,7 +441,7 @@ class DINOLoss(nn.Module):
 class DataAugmentationDINO(object):
     def __init__(self, global_crops_scale, local_crops_scale, local_crops_number):
         flip_and_color_jitter = transforms.Compose([
-            # transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomApply(
                 [transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1)],
                 p=0.8
@@ -451,20 +452,24 @@ class DataAugmentationDINO(object):
             transforms.ToTensor(),
             transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
         ])
+        gaussian_blur = transforms.GaussianBlur(1, (0.1, 2.0))
 
         # first global crop
         self.global_transfo1 = transforms.Compose([
             transforms.RandomResizedCrop(32, scale=global_crops_scale, interpolation=InterpolationMode.BICUBIC),
             flip_and_color_jitter,
-            utils.GaussianBlur(1.0),
+            # utils.GaussianBlur(1.0),
+            transforms.RandomApply([gaussian_blur], p=1.0),
             normalize,
         ])
         # second global crop
         self.global_transfo2 = transforms.Compose([
             transforms.RandomResizedCrop(32, scale=global_crops_scale, interpolation=InterpolationMode.BICUBIC),
             flip_and_color_jitter,
-            utils.GaussianBlur(0.1),
-            utils.Solarization(0.2),
+            # utils.GaussianBlur(0.1),
+            transforms.RandomApply([gaussian_blur], 0.1),
+            # utils.Solarization(0.2),
+            transforms.RandomSolarize(0, 0.2),
             normalize,
         ])
         # transformation for the local small crops
@@ -472,7 +477,8 @@ class DataAugmentationDINO(object):
         self.local_transfo = transforms.Compose([
             transforms.RandomResizedCrop(16, scale=local_crops_scale, interpolation=InterpolationMode.BICUBIC),
             flip_and_color_jitter,
-            utils.GaussianBlur(p=0.5),
+            # utils.GaussianBlur(p=0.5),
+            transforms.RandomApply([gaussian_blur], 0.1),
             normalize,
         ])
 
