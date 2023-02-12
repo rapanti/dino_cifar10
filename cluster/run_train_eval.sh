@@ -5,7 +5,7 @@
 #SBATCH -J vanilla-dino-cifar-other-transform # sets the job name. If not specified, the file name will be used as job name
 #SBATCH -o /work/dlclarge2/rapanti-metassl-dino-stn/experiments/vanilla-dino-cifar-other-transform/log/%A.%a.%N.out  # STDOUT
 #SBATCH -e /work/dlclarge2/rapanti-metassl-dino-stn/experiments/vanilla-dino-cifar-other-transform/log/%A.%a.%N.out  # STDERR
-#SBATCH --array 0-31%1
+#SBATCH --array 0-7%1
 
 # Print some information about the job to STDOUT
 echo "Workingdir: $PWD"
@@ -26,7 +26,6 @@ torchrun \
       --arch vit_nano \
       --img_size 32 \
       --patch_size 4 \
-      --stn_res 32 32 \
       --out_dim 32768 \
       --data_path /work/dlclarge2/rapanti-metassl-dino-stn/datasets/CIFAR10 \
       --dataset CIFAR10 \
@@ -34,10 +33,6 @@ torchrun \
       --epochs 200 \
       --warmup_epoch 20 \
       --batch_size 256 \
-      --invert_stn_gradients true \
-      --stn_theta_norm true \
-      --use_unbounded_stn true \
-      --stn_mode allflip \
       --local_crops_number 8 \
       --use_fp16 true \
       --saveckp_freq 100 \
@@ -45,7 +40,7 @@ torchrun \
 x=$?
 if [ $x == 0 ]
 then
-  scancel "$SLURM_JOB_ID"
+  scancel $SLURM_JOB_ID
 fi
 
 # Print some Information about the end-time to STDOUT
